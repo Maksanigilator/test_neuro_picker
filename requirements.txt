@@ -2,3 +2,9 @@ pybullet
 numpy
 torch
 trimesh
+open3d
+autolab_core
+perception
+scikit-image
+matplotlib
+#gqcnn

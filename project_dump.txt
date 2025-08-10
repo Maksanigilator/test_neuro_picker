@@ -1,0 +1,609 @@
+pile_sim.py
+```
+import pybullet as p
+import pybullet_data
+import time
+import numpy as np
+
+# 1) Подключаемся к PyBullet в режиме GUI
+physicsClient = p.connect(p.GUI)
+p.setAdditionalSearchPath(pybullet_data.getDataPath())  # чтобы найти plane.urdf
+
+# 2) Задаём параметры симуляции
+p.setGravity(0, 0, -9.81)
+timeStep = 1.0/240.0
+p.setTimeStep(timeStep)
+
+# 3) Добавляем «пол»
+planeId = p.loadURDF("plane.urdf")
+
+# 4) Функция для создания коробки (параллелепипеда)
+def create_box(size, mass, position):
+    # size = [dx, dy, dz] — габариты коробки
+    collision_shape = p.createCollisionShape(p.GEOM_BOX, halfExtents=[s/2 for s in size])
+    visual_shape    = p.createVisualShape(p.GEOM_BOX, halfExtents=[s/2 for s in size],
+                                          rgbaColor=[1,1,1,1])
+    body = p.createMultiBody(baseMass=mass,
+                             baseCollisionShapeIndex=collision_shape,
+                             baseVisualShapeIndex=visual_shape,
+                             basePosition=position)
+    return body
+
+# 5) Генерируем кучу из 10 случайных коробок
+np.random.seed(0)
+boxes = []
+for i in range(10):
+    size = [0.1 + 0.1*np.random.rand(), 0.1 + 0.1*np.random.rand(), 0.1 + 0.1*np.random.rand()]
+    mass = 0.5 + np.random.rand()*0.5
+    # случайная позиция в пределах квадрата 0.5×0.5 м, высота 1.5 м
+    pos = [0.0 + (np.random.rand()-0.5)*0.5,
+           0.0 + (np.random.rand()-0.5)*0.5,
+           1.0 + np.random.rand()*0.5]
+    box_id = create_box(size, mass, pos)
+    boxes.append(box_id)
+
+# 6) Даем коробкам упасть — несколько тысяч шагов симуляции
+for _ in range(240*5):  # ~5 секунд при 240 Гц
+    p.stepSimulation()
+    time.sleep(timeStep)
+
+# Скрипт будет висеть в окне GUI, пока вы не закроете его вручную
+print("Куча готова. Закройте окно симуляции, чтобы завершить.")
+try:
+    while True:
+        p.stepSimulation()
+        time.sleep(timeStep)
+except KeyboardInterrupt:
+    pass
+
+p.disconnect()
+```
+
+dataset.py
+```
+import pybullet as p
+import numpy as np
+import torch
+from torch.utils.data import Dataset
+from environment import BinPickingEnv
+
+class PickDataset(Dataset):
+    def __init__(self, n_samples=50):
+        self.env = BinPickingEnv(gui=False)
+        self.data = []
+        for i in range(n_samples):
+            print(f"Generating sample {i+1}/{n_samples}")
+            box_ids = self.env.reset_scene()
+            feats, labels = [], []
+            for bid in box_ids:
+                x,y,z = p.getBasePositionAndOrientation(bid)[0]
+                feats.append([z, x, y])
+                ok = self.env.simulate_pick(bid)
+                labels.append(float(ok))
+            self.data.append((np.array(feats, dtype=np.float32), np.array(labels, dtype=np.float32)))
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        feats, labels = self.data[idx]
+        return torch.from_numpy(feats), torch.from_numpy(labels)
+```
+
+environment.py
+```
+import pybullet as p
+import pybullet_data
+import numpy as np
+import time
+
+palet_h, palet_w, palet_t = 0.3, 0.5, 0.5
+
+class BinPickingEnv:
+    def __init__(self, gui=True):
+        self.gui = gui
+        self.client = p.connect(p.GUI if gui else p.DIRECT)
+        p.setAdditionalSearchPath(pybullet_data.getDataPath())
+        p.setGravity(0, 0, -9.81)
+        self.time_step = 1.0/240.0
+        p.setTimeStep(self.time_step)
+        # создаём единожды паллет
+        self._create_pallet()
+
+    def _create_pallet(self):
+        # Паллет 0.5×0.5×0.5 м, static body, высота нужна для корректного удаления упавших коробок
+        col = p.createCollisionShape(p.GEOM_BOX, halfExtents=[palet_t,palet_w,palet_h])
+        vis = p.createVisualShape(p.GEOM_BOX, halfExtents=[palet_t,palet_w,palet_h], rgbaColor=[0.8,0.6,0.4,1])
+        self.pallet = p.createMultiBody(baseMass=0,
+                                        baseCollisionShapeIndex=col,
+                                        baseVisualShapeIndex=vis,
+                                        basePosition=[0,0,0.05])
+
+    def reset_scene(self, n_boxes=None):
+        p.resetSimulation()
+        p.setGravity(0,0,-9.81)
+        p.loadURDF("plane.urdf")
+        self._create_pallet()
+        # создаём коробки с случайной позицией и ориентацией
+        n = np.random.randint(5, 40) if n_boxes is None else n_boxes
+        self.box_ids = []
+        for _ in range(n):
+            size = [0.1 + 0.1 * np.random.rand() for _ in range(3)]
+            mass = 0.5 + 0.5 * np.random.rand()
+            x, y = (np.random.rand(2) - 0.5) * 0.8
+            z = palet_h + 0.1 + 0.5 * np.random.rand()
+            # случайные углы по каждой оси
+            euler = np.random.rand(3) * np.pi
+            orn = p.getQuaternionFromEuler(euler)
+            col_b = p.createCollisionShape(p.GEOM_BOX, halfExtents=[s / 2 for s in size])
+            vis_b = p.createVisualShape(p.GEOM_BOX, halfExtents=[s / 2 for s in size], rgbaColor=[1, 1, 1, 1])
+            bid = p.createMultiBody(baseMass=mass,
+                                    baseCollisionShapeIndex=col_b,
+                                    baseVisualShapeIndex=vis_b,
+                                    basePosition=[x, y, z],
+                                    baseOrientation=orn)
+            self.box_ids.append(bid)
+        # дать падать
+        for _ in range(int(240*1.5)): p.stepSimulation(); time.sleep(self.time_step)
+        # удалить свалившиеся
+        self.remove_fallen(self.box_ids)
+        # дать стабилизироваться
+        for _ in range(int(240*2)): p.stepSimulation(); time.sleep(self.time_step)
+        return list(self.box_ids)
+
+    def simulate_pick(self, box_id):
+        # 1) Получаем текущую позицию и ориентацию объекта
+        pos, orn = p.getBasePositionAndOrientation(box_id)  # pos = [x,y,z], orn = [qx,qy,qz,qw]
+        # 2) Определяем высоту старта: z + половина высоты коробки + небольшой зазор
+        half_dims = p.getCollisionShapeData(box_id, -1)[0][3]  # [hx, hy, hz]
+        start_z = pos[2] + half_dims[2] + 0.01
+
+        # 3) Создаём «присоску» в той же ориентации
+        gr = p.createMultiBody(
+            baseMass=0,
+            baseCollisionShapeIndex=-1,
+            baseVisualShapeIndex=-1,
+            basePosition=[pos[0], pos[1], start_z],
+            baseOrientation=orn
+        )
+        # 4) Фиксируем её к коробке (JOINT_FIXED учитывает ориентацию)
+        cid = p.createConstraint(
+            parentBodyUniqueId=gr, parentLinkIndex=-1,
+            childBodyUniqueId=box_id, childLinkIndex=-1,
+            jointType=p.JOINT_FIXED,
+            jointAxis=[0, 0, 0],
+            parentFramePosition=[0, 0, 0],
+            childFramePosition=[0, 0, 0],
+            parentFrameOrientation=[0, 0, 0, 1],
+            childFrameOrientation=[0, 0, 0, 1]
+        )
+
+        # 5) Поднимаем вместе: меняем позицию присоски, ориентацию не трогаем
+        for dz in np.linspace(start_z, start_z + 0.5, 200):
+            p.resetBasePositionAndOrientation(gr, [pos[0], pos[1], dz], orn)
+            p.stepSimulation()
+            time.sleep(self.time_step)
+            # После подъёма даём время упавшим объектам спуститься
+        for _ in range(int(240 * 1.5)):  # 1.5 секунда ожидания
+            p.stepSimulation();
+            time.sleep(self.time_step)
+        # Убираем constraint и захват
+        p.removeConstraint(cid)
+        p.removeBody(gr)
+
+        # 7) Проверка успеха: ни одна другая коробка не упала
+        for other in self.box_ids:
+            if other == box_id:
+                continue
+            if p.getBasePositionAndOrientation(other)[0][2] < palet_h * 0.9:
+                # Удаляем упавшие при этом коробки
+                self.remove_fallen(self.box_ids)
+                return False
+        return True
+
+    def remove_fallen(self, box_ids):
+        alive = []
+        for bid in self.box_ids:
+            if p.getBasePositionAndOrientation(bid)[0][2] > palet_h * 0.9:
+                alive.append(bid)
+            else:
+                p.removeBody(bid)
+        self.box_ids = alive
+
+    def remove_box(self, box_id):
+        if box_id in self.box_ids:
+            p.removeBody(box_id)
+            self.box_ids.remove(box_id)
+
+    def close(self):
+        p.disconnect(self.client)
+
+```
+
+model.py
+
+```
+
+import torch
+import torch.nn as nn
+
+class PickerNet(nn.Module):
+    def __init__(self, in_features=3, hidden=64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_features, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, 1)
+        )
+    def forward(self, x):
+        B,N,F = x.shape
+        y = self.net(x.view(B*N, F))
+        return y.view(B, N)
+
+```
+
+run_sim.py
+```
+
+import pybullet as p
+import torch
+import numpy as np
+import time
+from environment import BinPickingEnv
+from model import PickerNet
+from realsence_sim import RealSenseCamera ###реалсенс
+
+# Подготовка модели
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = PickerNet().to(device)
+try:
+    model.load_state_dict(torch.load("picker_net.pth", map_location=device))
+    print("Loaded picker_net.pth")
+except FileNotFoundError:
+    model.load_state_dict(torch.load("picker_net_interrupted.pth", map_location=device))
+    print("Loaded picker_net_interrupted.pth")
+model.eval()
+
+# Запуск GUI и разбор кучи
+env = BinPickingEnv(gui=True)
+box_ids = env.reset_scene()
+camera = RealSenseCamera(
+    position=[0.0, 0.0, 2.0],
+    target=[0.0, 0.0, 0.0]
+)
+
+# Цикл разбора одной за одной
+###реалсенс
+rgb = camera.get_rgb_image()
+seg = camera.get_segmentation_image()
+objects_info = camera.analyze_objects_in_view()
+###реалсенс
+while box_ids:
+    feats = []
+    for bid in box_ids:
+        x, y, z = p.getBasePositionAndOrientation(bid)[0]
+        feats.append([z, x, y])
+    feats = np.array(feats, dtype=np.float32)
+
+    # Предсказание и выбор лучшего
+    with torch.no_grad():
+        scores = model(torch.from_numpy(feats).unsqueeze(0).to(device))
+        scores = scores.cpu().numpy().reshape(-1)
+    best_idx = int(np.argmax(scores))
+    chosen = box_ids[best_idx]
+    print(f"Picking object {chosen} (score {scores[best_idx]:.3f}), remaining {len(box_ids)} boxes")
+
+    # Симуляция захвата
+    success = env.simulate_pick(chosen)
+    print(" -> success" if success else " -> failed")
+
+    # Удаляем поднятую коробку
+    env.remove_box(chosen)
+    # Удаляем упавшие коробки после захвата
+    env.remove_fallen(env.box_ids)
+    # Обновляем список оставшихся
+    box_ids = env.box_ids.copy()
+
+print("All boxes picked")
+env.close()
+
+```
+
+train.p
+```
+import torch
+from torch.utils.data import DataLoader
+from dataset import PickDataset
+from model import PickerNet
+import torch.optim as optim
+import signal, sys
+
+# Проверка CUDA
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
+
+# Параметры обучения
+n_samples = 7
+epochs = 5
+
+# Датасет и загрузчик
+from torch.utils.data import DataLoader
+dataset = PickDataset(n_samples=n_samples)
+loader = DataLoader(dataset, batch_size=1, shuffle=True)
+
+# Модель и оптимизатор
+model = PickerNet().to(device)
+opt = optim.Adam(model.parameters(), lr=1e-3)
+criterion = torch.nn.BCEWithLogitsLoss()
+
+# Обработчик Ctrl+C для сохранения
+def handler(sig, frame):
+    print("Interrupted, saving...")
+    torch.save(model.state_dict(), "picker_net_interrupted.pth")
+    sys.exit(0)
+signal.signal(signal.SIGINT, handler)
+# Обучение
+for epoch in range(1, epochs+1):
+    total_loss = 0
+    for feats, labels in loader:
+        feats, labels = feats.to(device), labels.to(device)
+        preds = model(feats)
+        loss = criterion(preds, labels)
+        opt.zero_grad(); loss.backward(); opt.step()
+        total_loss += loss.item()
+    print(f"Epoch {epoch}/{epochs}, loss={total_loss/len(loader):.4f}")
+# Сохраняем модель
+torch.save(model.state_dict(), "picker_net.pth")
+print("Training finished.")
+```
+realsence_sim.py
+```
+import pybullet as p
+import numpy as np
+import cv2
+
+
+class RealSenseCamera:
+    """
+    Симуляция камеры RealSense D435 в PyBullet
+    """
+
+    def __init__(self, position, target, up_vector=[0, 1, 0]):
+        self.position = position
+        self.target = target
+        self.up_vector = up_vector
+
+        # Параметры камеры RealSense D435
+        self.width = 640
+        self.height = 480
+        self.fov = 69.4  # поле зрения по горизонтали в градусах
+        self.aspect = self.width / self.height
+        self.near = 0.1
+        self.far = 5.0
+
+        # Внутренние параметры камеры (для облака точек)
+        self.fx = self.fy = self.width / (2 * np.tan(np.radians(self.fov) / 2))
+        self.cx, self.cy = self.width / 2, self.height / 2
+
+        # Вычисляем матрицы проекции и вида
+        self.update_matrices()
+
+        # Визуализация камеры в симуляции
+        self.camera_body = None
+        self.create_camera_visualization()
+
+    def update_matrices(self):
+        """Обновляет матрицы проекции и вида"""
+        self.projection_matrix = p.computeProjectionMatrixFOV(
+            self.fov, self.aspect, self.near, self.far
+        )
+
+        self.view_matrix = p.computeViewMatrix(
+            self.position, self.target, self.up_vector
+        )
+
+    def create_camera_visualization(self):
+        """Создаёт визуализацию камеры в виде небольшого объекта"""
+        # Создаём маленький куб для обозначения камеры
+        collision_shape = p.createCollisionShape(p.GEOM_BOX, halfExtents=[0.02, 0.05, 0.02])
+        visual_shape = p.createVisualShape(p.GEOM_BOX, halfExtents=[0.02, 0.05, 0.02],
+                                           rgbaColor=[0.2, 0.2, 0.8, 1.0])  # синий цвет
+        self.camera_body = p.createMultiBody(baseMass=0,  # статический объект
+                                             baseCollisionShapeIndex=collision_shape,
+                                             baseVisualShapeIndex=visual_shape,
+                                             basePosition=self.position)
+
+    def move_camera(self, new_position, new_target=None):
+        """Перемещает камеру в новую позицию"""
+        self.position = new_position
+        if new_target is not None:
+            self.target = new_target
+
+        # Обновляем матрицы
+        self.update_matrices()
+
+        # Обновляем визуализацию
+        if self.camera_body is not None:
+            p.resetBasePositionAndOrientation(self.camera_body, self.position, [0, 0, 0, 1])
+
+    def get_camera_images(self):
+        """
+        Получает все типы изображений с камеры одновременно
+        Возвращает: (rgb, depth, segmentation)
+        """
+        width, height, rgb_img, depth_img, seg_img = p.getCameraImage(
+            width=self.width,
+            height=self.height,
+            viewMatrix=self.view_matrix,
+            projectionMatrix=self.projection_matrix,
+            renderer=p.ER_BULLET_HARDWARE_OPENGL
+        )
+
+        # RGB изображение
+        rgb_array = np.array(rgb_img, dtype=np.uint8).reshape((height, width, 4))
+        rgb_array = rgb_array[:, :, :3]  # убираем альфа канал
+
+        # Depth изображение (преобразуем в метры)
+        depth_array = np.array(depth_img, dtype=np.float32).reshape((height, width))
+        depth_real = self.far * self.near / (self.far - (self.far - self.near) * depth_array)
+        depth_real = np.clip(depth_real, self.near, self.far)
+
+        # Segmentation изображение (ID объектов)
+        seg_array = np.array(seg_img, dtype=np.int32).reshape((height, width))
+
+        return rgb_array, depth_real, seg_array
+
+    def get_rgb_image(self):
+        """Получает только RGB изображение"""
+        rgb, _, _ = self.get_camera_images()
+        return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)  # для OpenCV
+
+    def get_depth_image(self):
+        """Получает только depth изображение в метрах"""
+        _, depth, _ = self.get_camera_images()
+        return depth
+
+    def get_segmentation_image(self):
+        """Получает карту сегментации (ID объектов)"""
+        _, _, seg = self.get_camera_images()
+        return seg
+
+    def visualize_segmentation(self, seg_image, colorize=True):
+        """
+        Создает цветную визуализацию сегментации
+        """
+        if not colorize:
+            # Простая нормализация для отображения
+            seg_normalized = cv2.normalize(seg_image.astype(np.float32), None, 0, 255, cv2.NORM_MINMAX)
+            return seg_normalized.astype(np.uint8)
+
+        # Цветная сегментация
+        unique_ids = np.unique(seg_image)
+        colored_seg = np.zeros((seg_image.shape[0], seg_image.shape[1], 3), dtype=np.uint8)
+
+        # Генерируем уникальные цвета для каждого объекта
+        np.random.seed(42)  # для воспроизводимости цветов
+        colors = np.random.randint(0, 255, size=(len(unique_ids), 3))
+
+        for i, obj_id in enumerate(unique_ids):
+            if obj_id == -1:  # фон
+                colored_seg[seg_image == obj_id] = [0, 0, 0]  # черный
+            else:
+                colored_seg[seg_image == obj_id] = colors[i]
+
+        return colored_seg
+
+    def get_point_cloud(self, subsample=5):
+        """
+        Получает облако точек с RGB данными
+        subsample: шаг прореживания (каждый N-й пиксель)
+        """
+        rgb_img, depth_img, seg_img = self.get_camera_images()
+
+        points = []
+        colors = []
+        object_ids = []
+
+        for v in range(0, self.height, subsample):
+            for u in range(0, self.width, subsample):
+                z = depth_img[v, u]
+
+                if z > self.near and z < self.far:
+                    # Преобразование из пиксельных координат в координаты камеры
+                    x = (u - self.cx) * z / self.fx
+                    y = (v - self.cy) * z / self.fy
+
+                    # Точка в системе координат камеры
+                    camera_point = np.array([x, y, -z])  # -z потому что камера смотрит по -Z
+
+                    # Преобразование в мировые координаты (упрощенное для камеры, смотрящей вниз)
+                    # Для точного преобразования нужно использовать матрицы поворота
+                    world_point = np.array([
+                        self.position[0] + x,
+                        self.position[1] + y,
+                        self.position[2] - z
+                    ])
+
+                    points.append(world_point)
+                    colors.append(rgb_img[v, u])
+                    object_ids.append(seg_img[v, u])
+
+        return np.array(points), np.array(colors), np.array(object_ids)
+
+    def analyze_objects_in_view(self):
+        """
+        Анализирует какие объекты видны в кадре и их статистики
+        """
+        _, _, seg_img = self.get_camera_images()
+
+        unique_ids, counts = np.unique(seg_img, return_counts=True)
+
+        objects_info = {}
+        total_pixels = seg_img.shape[0] * seg_img.shape[1]
+
+        for obj_id, pixel_count in zip(unique_ids, counts):
+            if obj_id == -1:
+                objects_info['background'] = {
+                    'id': obj_id,
+                    'pixel_count': pixel_count,
+                    'coverage_percent': (pixel_count / total_pixels) * 100
+                }
+            else:
+                objects_info[f'object_{obj_id}'] = {
+                    'id': obj_id,
+                    'pixel_count': pixel_count,
+                    'coverage_percent': (pixel_count / total_pixels) * 100
+                }
+
+        return objects_info
+
+    def get_object_mask(self, object_id):
+        """
+        Получает маску конкретного объекта
+        """
+        _, _, seg_img = self.get_camera_images()
+        mask = (seg_img == object_id).astype(np.uint8) * 255
+        return mask
+
+    def get_depth_in_meters_colorized(self):
+        """Возвращает цветную карту глубины для визуализации"""
+        depth = self.get_depth_image()
+        depth_normalized = cv2.normalize(depth, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+        return cv2.applyColorMap(depth_normalized, cv2.COLORMAP_JET)
+    # Пример использования (можно раскомментировать для тестирования)
+    """
+    # Инициализация PyBullet должна быть выполнена до создания камеры
+    import pybullet_data
+
+    physicsClient = p.connect(p.GUI)
+    p.setAdditionalSearchPath(pybullet_data.getDataPath())
+    p.setGravity(0, 0, -9.81)
+    planeId = p.loadURDF("plane.urdf")
+
+    # Создание простого объекта для тестирования
+    box_collision = p.createCollisionShape(p.GEOM_BOX, halfExtents=[0.1, 0.1, 0.1])
+    box_visual = p.createVisualShape(p.GEOM_BOX, halfExtents=[0.1, 0.1, 0.1], rgbaColor=[1, 0, 0, 1])
+    box_id = p.createMultiBody(baseMass=1, baseCollisionShapeIndex=box_collision,
+                              baseVisualShapeIndex=box_visual, basePosition=[0, 0, 1])
+
+    # Создание камеры
+    camera = RealSenseCamera(
+        position=[0, 0, 2],
+        target=[0, 0, 0]
+    )
+
+    # Получение изображений
+    rgb = camera.get_rgb_image()
+    depth = camera.get_depth_in_meters_colorized()
+    seg = camera.get_segmentation_image()
+    seg_colored = camera.visualize_segmentation(seg)
+
+    # Анализ объектов
+    objects_info = camera.analyze_objects_in_view()
+    print("Объекты в кадре:", objects_info)
+
+    p.disconnect()
+    """
+```
