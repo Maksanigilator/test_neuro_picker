@@ -1,3 +1,4 @@
+# environment.py
 import pybullet as p
 import pybullet_data
 import numpy as np
@@ -50,9 +51,15 @@ class BinPickingEnv:
                                     basePosition=[x, y, z],
                                     baseOrientation=orn)
             self.box_ids.append(bid)
-        for _ in range(int(240 * 1.5)): p.stepSimulation(); time.sleep(self.time_step)
+        for _ in range(int(240 * 1.5)):
+            p.stepSimulation()
+            if self.gui:
+                time.sleep(self.time_step)
         self.remove_fallen(self.box_ids)
-        for _ in range(int(240 * 2)): p.stepSimulation(); time.sleep(self.time_step)
+        for _ in range(int(240 * 2)):
+            p.stepSimulation()
+            if self.gui:
+                time.sleep(self.time_step)
         return list(self.box_ids)
 
     def simulate_pick(self, box_id, remove_on_fail=True):
@@ -79,14 +86,15 @@ class BinPickingEnv:
         for dz in np.linspace(start_z, start_z + 0.5, 200):
             p.resetBasePositionAndOrientation(gr, [pos[0], pos[1], dz], orn)
             p.stepSimulation()
-            time.sleep(self.time_step)
+            if self.gui:
+                time.sleep(self.time_step)
         for _ in range(int(240 * 1.5)):
             p.stepSimulation()
-            time.sleep(self.time_step)
+            if self.gui:
+                time.sleep(self.time_step)
         p.removeConstraint(cid)
         p.removeBody(gr)
 
-        # Проверка успеха: ни одна другая коробка не упала
         success = True
         for other in self.box_ids:
             if other == box_id: continue
@@ -94,7 +102,7 @@ class BinPickingEnv:
                 if remove_on_fail:
                     self.remove_fallen(self.box_ids)
                 success = False
-                break  # Нет нужды проверять дальше
+                break
         return success
 
     def remove_fallen(self, box_ids):

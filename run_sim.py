@@ -28,7 +28,7 @@ crop_size = 64
 # Load model
 model = PickerNet(crop_size=crop_size).to(device)
 try:
-    model.load_state_dict(torch.load("picker_net.pth", map_location=device))
+    model.load_state_dict(torch.load("picker_net(small).pth", map_location=device))
 except FileNotFoundError:
     model.load_state_dict(torch.load("picker_net_interrupted.pth", map_location=device))
 model.eval()
