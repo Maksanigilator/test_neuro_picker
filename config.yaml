@@ -1,0 +1,6 @@
+dataset:
+  train_dir: ../datasets/train/  # Путь к папке для train сцен (h5 файлы)
+  val_dir: ../datasets/val/      # Путь к папке для val сцен
+  n_scenes: 10000               # Общее количество сцен для генерации
+# Добавьте другие, если нужно, e.g.:
+#  visualize: false
